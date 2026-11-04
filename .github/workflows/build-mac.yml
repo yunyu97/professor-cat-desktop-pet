@@ -1,0 +1,34 @@
+# Builds ProfessorCatLife.app and ProfessorCatStudy.app on GitHub's Mac machines.
+# Push this folder to a GitHub repo, open the "Actions" tab, pick "Build macOS apps",
+# click "Run workflow", then download the zips from the finished run.
+name: Build macOS apps
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14   # Apple Silicon (M1/M2/M3/M4)
+            arch: apple-silicon
+          - runner: macos-13   # Intel Macs
+            arch: intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build apps
+        run: bash build_mac.sh
+      - name: Zip apps (keeps symlinks and permissions)
+        run: |
+          cd dist
+          ditto -c -k --keepParent ProfessorCatLife.app  ProfessorCatLife-mac-${{ matrix.arch }}.zip
+          ditto -c -k --keepParent ProfessorCatStudy.app ProfessorCatStudy-mac-${{ matrix.arch }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: professor-cat-mac-${{ matrix.arch }}
+          path: dist/*.zip
