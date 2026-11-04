@@ -41,6 +41,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='professor_cat.ico',
+    version='version_Study.txt',
 )
 coll = COLLECT(
     exe,
