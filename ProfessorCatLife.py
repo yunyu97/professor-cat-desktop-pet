@@ -464,11 +464,15 @@ class SpeechBubble(QWidget):
 class LifelikeCat(QWidget):
     W, H = 240, 294          # window size
     GROUND_Y = 182           # y (inside the window) where the paws touch the floor
-    SPRITE_SCALE = 0.80      # one global scale for every frame -> no size popping
+    # one global scale for every frame -> no size popping (0.70 keeps the on-screen
+    # size the idle cat always had; the idle frames are now stored 15% larger)
+    SPRITE_SCALE = 0.70
 
     # Movement tuning (pixels / second)
     WALK_SPEED = 46.0
-    TROT_SPEED = 95.0
+    RUN_SPEED = 150.0        # zoomies: a real gallop, not fast walking
+    RUN_ACCEL = 240.0
+    RUN_DECEL = 200.0
     ACCEL = 70.0
     DECEL = 90.0
     STRIDE_PX = 62.0         # distance covered by one full walk cycle at SPRITE_SCALE=1
@@ -531,6 +535,7 @@ class LifelikeCat(QWidget):
         self.state_duration = 2.0
         self.target_x = self.x
         self.cruise_speed = self.WALK_SPEED
+        self.gait = "walk"
         self.walk_phase = 0.0       # 0..1 along the walk cycle
         self.pose_frame = 0         # frame index for posed (non-walk) states
         self.pose_clock = 0.0
@@ -538,7 +543,6 @@ class LifelikeCat(QWidget):
         self.landing_squash = 0.0
         self.time = 0.0
         self.wandering_enabled = True
-        self.tired = 0.0            # grows while active; makes naps more likely
 
         # dragging
         self.dragging = False
@@ -561,6 +565,7 @@ class LifelikeCat(QWidget):
         # so the browser engine no longer delays startup.
         self.music = YouTubeMusic(self)
         self.music.changed.connect(self.update)
+        self.show_music_controls = self.music.settings.value("ui/music_controls", "true") == "true"
         QTimer.singleShot(600, self.start_music_when_calm)
 
         # rest reminder
@@ -622,46 +627,108 @@ class LifelikeCat(QWidget):
         return img
 
     # ------------------------------------------------------------------
-    # Hind legs (procedural, so they can overlap and be shaded separately)
+    # Legs: all four are drawn procedurally so the gait is coordinated
     # ------------------------------------------------------------------
-    UPPER_LEG = 26.0   # hip -> hock, sprite pixels
-    LOWER_LEG = 21.0   # hock -> paw
-    DUTY = 0.62        # fraction of the cycle a paw is planted
-    LIFT = 9.0         # how high a paw lifts during the swing
-    HIND_PHASE = 0.15  # timing of hind legs relative to the front-leg frames
-    FAR_HIP = (7.0, -3.0)   # inward leg's hip sits a little forward/up -> partial overlap
+    # Phase offsets follow the classic cat walk cycle (lateral sequence): paws touch
+    # down left hind -> left fore -> right hind -> right fore, a quarter cycle apart,
+    # so each fore paw lifts just as the hind paw on the same side lands.
+    # A leg with offset o touches down at global phase (1 - o).
+    # Frames half a cycle apart are mirror images, and with a duty factor of 0.66
+    # at least two paws are always on the ground.
+    GAITS = {
+        "walk": {"offsets": {"LH": 0.00, "LF": 0.75, "RH": 0.50, "RF": 0.25},
+                 "duty": 0.66, "lift_h": 6.0, "lift_f": 7.0, "curl": 40.0},
+        # rotary gallop: hind pair lands close together, then the fore pair, with a
+        # moment of suspension; long strides instead of quick little steps
+        "gallop": {"offsets": {"LH": 0.00, "RH": 0.09, "LF": 0.50, "RF": 0.60},
+                   "duty": 0.34, "lift_h": 12.0, "lift_f": 13.0, "curl": 60.0},
+    }
+    NEAR = ("RH", "RF")          # legs on the viewer's side, drawn in front of the body
+    FAR_OFFSET = (6.0, -3.0)     # far legs attach a little forward/up -> partial overlap
+    # segment lengths in sprite pixels
+    # cat proportions: femur ~ tibia, long metatarsus (the 'heel' sits high and behind)
+    # storybook proportions (like the reference painting): short, tapered legs that
+    # stay nearly straight, with small neat paws
+    THIGH, SHIN, META = 17.0, 18.0, 11.0          # hind: hip-knee-hock-paw
+    HIND_STEP_BACK = 8.0                           # hind step centred behind the hip (lands ~under it)
+    UPPER_ARM, FOREARM, PASTERN = 12.0, 18.0, 5.0  # fore: shoulder-elbow-wrist-paw (short)
 
-    def paw_target(self, phase, hip, ground):
-        """Paw position for one hind leg. Planted during stance (slides back exactly
-        as fast as the body moves forward), then lifted and swung forward."""
-        reach = self.DUTY * self.STRIDE_PX / 2.0
-        hx, _ = hip
-        if self.dragging or self.state == "fall":
-            # dangling: paws hang and paddle a little
-            return hx + 4 * math.sin(phase * math.tau), ground - 6
-        if phase < self.DUTY:
-            t = phase / self.DUTY
-            return hx + reach * (1 - 2 * t), ground
-        t = (phase - self.DUTY) / (1 - self.DUTY)
+    def gait_params(self):
+        g = self.GAITS[self.gait]
+        speed = abs(self.vx)
+        if self.gait == "gallop":
+            # stride grows with speed, so faster = longer bounds, not faster steps
+            stride = max(self.STRIDE_PX, min(165.0, 50.0 + speed * 0.78))
+        else:
+            stride = self.STRIDE_PX
+        return g, stride
+
+    def paw_path(self, phase, base_x, ground, duty, reach, lift):
+        """(x, y, swing_t or None). Planted during stance: the paw slides back exactly
+        as fast as the body moves forward, so it stays put on the floor."""
+        if phase < duty:
+            t = phase / duty
+            return base_x + reach * (1 - 2 * t), ground, None, t
+        t = (phase - duty) / (1 - duty)
         ease = (1 - math.cos(math.pi * t)) / 2
-        return hx - reach + 2 * reach * ease, ground - self.LIFT * math.sin(math.pi * t)
+        return base_x - reach + 2 * reach * ease, ground - lift * math.sin(math.pi * t), t, None
 
-    def leg_joints(self, hip, paw):
-        """Two-bone IK. The hock bends backwards, like a real cat's hind leg."""
-        hx, hy = hip
-        px, py = paw
-        dx, dy = px - hx, py - hy
-        d = max(1e-3, min(math.hypot(dx, dy), self.UPPER_LEG + self.LOWER_LEG - 0.5))
+    @staticmethod
+    def two_bone(root, target, l1, l2, joint_forward):
+        """Two-bone IK. joint_forward=True puts the middle joint in front (a knee),
+        False behind (an elbow)."""
+        rx, ry = root
+        tx, ty = target
+        dx, dy = tx - rx, ty - ry
+        d = max(1e-3, min(math.hypot(dx, dy), l1 + l2 - 0.3))
         base = math.atan2(dy, dx)
-        cos_a = (self.UPPER_LEG ** 2 + d ** 2 - self.LOWER_LEG ** 2) / (2 * self.UPPER_LEG * d)
+        cos_a = (l1 * l1 + d * d - l2 * l2) / (2 * l1 * d)
         a = math.acos(max(-1.0, min(1.0, cos_a)))
-        cands = [(hx + self.UPPER_LEG * math.cos(base + s * a),
-                  hy + self.UPPER_LEG * math.sin(base + s * a)) for s in (1, -1)]
-        hock = min(cands, key=lambda c: c[0])  # the joint that points backwards
-        # re-derive the paw from the clamped length so segments stay rigid
-        ang = math.atan2(py - hock[1], px - hock[0])
-        paw = (hock[0] + self.LOWER_LEG * math.cos(ang), hock[1] + self.LOWER_LEG * math.sin(ang))
-        return hock, paw
+        cands = [(rx + l1 * math.cos(base + s * a), ry + l1 * math.sin(base + s * a)) for s in (1, -1)]
+        joint = max(cands, key=lambda c: c[0]) if joint_forward else min(cands, key=lambda c: c[0])
+        ang = math.atan2(ty - joint[1], tx - joint[0])
+        end = (joint[0] + l2 * math.cos(ang), joint[1] + l2 * math.sin(ang))
+        return joint, end
+
+    def leg_pose(self, leg, pivot, phase, ground):
+        """Joint positions for one leg: [pivot, j1, j2, paw]."""
+        g, stride = self.gait_params()
+        hind = leg.endswith("H")
+        total = (self.THIGH + self.SHIN + self.META) if hind else (self.UPPER_ARM + self.FOREARM + self.PASTERN)
+        px0, py0 = pivot
+        if self.dragging or self.state == "fall":
+            # dangling: legs hang loosely and paddle a little
+            paddle = math.sin((phase + (0.3 if hind else 0.0)) * math.tau)
+            paw = (px0 + 3 * paddle + (-4 if hind else 2), py0 + total * 0.9)
+            flex = 10.0 if hind else 20.0
+            stance_t, swing_t = None, None
+        else:
+            reach = g["duty"] * stride / 2.0
+            lift = g["lift_h"] if hind else g["lift_f"]
+            base_x = px0 - self.HIND_STEP_BACK if hind else px0
+            x, y, swing_t, stance_t = self.paw_path(phase, base_x, ground, g["duty"], reach, lift)
+            paw = (x, y)
+            if hind:
+                # metatarsus angle (+ = hock in front of the paw). Like a real cat the
+                # hock stays BEHIND the paw while the foot is planted (lower leg slopes
+                # down-forward); the heel lifts at push-off and the foot folds back in
+                # the swing before reaching forward to land.
+                flex = (-24 + 30 * stance_t) if stance_t is not None else \
+                    (6 + (-24 - 6) * swing_t + 38 * math.sin(math.pi * swing_t))
+            else:
+                # wrist: nearly straight in stance, curls back during the swing (ref. frames 3/7)
+                flex = (-4 + 18 * stance_t) if stance_t is not None else \
+                    (14 + (-10 - 14) * swing_t + g["curl"] * math.sin(math.pi * swing_t) ** 1.4)
+        f = math.radians(flex)
+        tip = self.META if hind else self.PASTERN
+        # j2 (hock / wrist) sits above the paw, tilted by the flex angle
+        j2_target = (paw[0] + tip * math.sin(f), paw[1] - tip * math.cos(f))
+        if hind:
+            j1, j2 = self.two_bone(pivot, j2_target, self.THIGH, self.SHIN, joint_forward=True)
+        else:
+            j1, j2 = self.two_bone(pivot, j2_target, self.UPPER_ARM, self.FOREARM, joint_forward=False)
+        paw = (j2[0] - tip * math.sin(f), j2[1] + tip * math.cos(f))
+        return [pivot, j1, j2, paw]
 
     @staticmethod
     def tapered(p0, p1, w0, w1):
@@ -676,18 +743,31 @@ class LifelikeCat(QWidget):
                           QPointF(x1 - nx * w1 / 2, y1 - ny * w1 / 2),
                           QPointF(x0 - nx * w0 / 2, y0 - ny * w0 / 2)])
 
-    def leg_shapes(self, hip, hock, paw, k, grow=0.0):
+    def leg_shapes(self, joints, hind, k, grow=0.0):
         """Draw-calls for one leg: (kind, args). grow>0 inflates it for the outline."""
         g = grow * 2
-        w_hip, w_hock, w_paw = 17 * k + g, 11 * k + g, 9 * k + g
-        foot = QPointF(paw[0] + 3.0, paw[1] + 1.0)
-        return [
-            ("poly", self.tapered(hip, hock, w_hip, w_hock)),
-            ("poly", self.tapered(hock, paw, w_hock - 1, w_paw)),
-            ("ell", (QPointF(*hip), w_hip / 2, w_hip / 2)),
-            ("ell", (QPointF(*hock), w_hock / 2, w_hock / 2)),
-            ("ell", (foot, 7.0 * k + grow, 4.3 * k + grow)),
-        ]
+        shapes = []
+        if hind:
+            widths = [w * k + g for w in (27, 14, 10, 8.5)]
+            for i in range(3):
+                shapes.append(("poly", self.tapered(joints[i], joints[i + 1], widths[i], widths[i + 1])))
+                shapes.append(("ell", (QPointF(*joints[i]), widths[i] / 2, widths[i] / 2)))
+        else:
+            # storybook fore leg: one smooth cone from the chest to the wrist, so the
+            # elbow never pokes out behind the leg as a bump under the belly
+            sh, wr = joints[0], joints[2]
+            w0, w1, w2 = 17 * k + g, 10.5 * k + g, 9 * k + g
+            shapes.append(("poly", self.tapered(sh, wr, w0, w1)))
+            shapes.append(("poly", self.tapered(wr, joints[3], w1, w2)))
+            shapes.append(("ell", (QPointF(*wr), w1 / 2, w1 / 2)))
+            shapes.append(("ell", (QPointF(*sh), w0 / 2, w0 / 2)))
+        # small paw: a soft little toe pointing forward, flat on the floor
+        paw = joints[3]
+        if hind:
+            shapes.append(("ell", (QPointF(paw[0] + 1.6, paw[1] + 0.6), 4.0 * k + grow, 2.3 * k + grow)))
+        else:
+            shapes.append(("ell", (QPointF(paw[0] + 1.2, paw[1] - 0.6), 5.2 * k + grow, 3.4 * k + grow)))
+        return shapes
 
     @staticmethod
     def fill_shapes(painter, shapes):
@@ -697,76 +777,271 @@ class LifelikeCat(QWidget):
             else:
                 painter.drawEllipse(*arg)
 
-    def draw_hind_leg(self, p, hip, phase, ground, far):
-        paw_t = self.paw_target(phase, hip, ground - 4)
-        hock, paw = self.leg_joints(hip, paw_t)
-        k = 0.90 if far else 1.0
-
+    def draw_leg(self, p, joints, hind, far, ground, body_mask=None):
+        pivot = joints[0]
+        k = 0.92 if far else 1.0
         thigh = QColor(*self.rig["thigh"])
         paw_c = QColor(*self.rig["paw"])
-        body = QColor(*self.rig["body"])
-        if far:
-            # inward leg: in shadow -> clearly darker and a little cooler
-            shade = lambda c, f: QColor(int(c.red() * f), int(c.green() * f), int(c.blue() * f * 1.04))
+        body = QColor(*self.rig["body" if hind else "chest"])
+        mix = lambda a, b, t: QColor(int(a.red() + (b.red() - a.red()) * t),
+                                     int(a.green() + (b.green() - a.green()) * t),
+                                     int(a.blue() + (b.blue() - a.blue()) * t))
+        idle = self.rig.get("idle_leg")
+        if idle:
+            # same fur as the idling cat's painted legs (sampled by prepare_life_sprites)
+            top, mid, bot = (QColor(*idle[n]) for n in ("top", "mid", "bot"))
+            if far:
+                dark = QColor(*idle["dark"])
+                top, mid, bot = mix(dark, top, 0.25), dark, mix(dark, bot, 0.15)
+        elif far:
+            # inward legs: in the body's shadow -> clearly darker and a little cooler
+            shade = lambda c, f: QColor(int(c.red() * f), int(c.green() * f), min(255, int(c.blue() * f * 1.05)))
             top, mid, bot = shade(thigh, 0.74), shade(thigh, 0.70), shade(paw_c, 0.72)
         else:
-            # outward leg: lit, warmer; blends into the haunch at the top
-            mix = lambda a, b, t: QColor(int(a.red() + (b.red() - a.red()) * t),
-                                         int(a.green() + (b.green() - a.green()) * t),
-                                         int(a.blue() + (b.blue() - a.blue()) * t))
+            # outward legs: lit and warm, melting into the body at the top
             top, mid, bot = mix(thigh, body, 0.55), mix(thigh, body, 0.20), mix(paw_c, body, 0.30)
-        grad = QLinearGradient(QPointF(0, hip[1] - 9), QPointF(0, ground))
-        fade_end = min(0.9, 20.0 / max(1.0, ground - hip[1] + 9))
-        if far:
-            grad.setColorAt(0.0, top)
+        top_y = pivot[1] - 14
+        span = max(1.0, ground - top_y)
+        at = lambda y: max(0.0, min(1.0, (y - top_y) / span))
+        grad = QLinearGradient(QPointF(0, top_y), QPointF(0, ground))
+        if hind:
+            # haunch in the coat colour (it is the rump), darkening from the knee down
+            # like the painted legs in the reference art
+            hock_y = joints[2][1]
+            coat = mix(body, QColor(0, 0, 0), 0.30) if far else mix(body, thigh, 0.12)
+            # like the painted legs: coat colour on the thigh, then a long soft blend
+            # into the grey-brown lower leg (no hard 'sock' line)
+            grad.setColorAt(0.0, coat)
+            grad.setColorAt(at(pivot[1] + 14), coat)
+            grad.setColorAt(at(pivot[1] + 27), mix(top, coat, 0.10))
+            grad.setColorAt(at(hock_y), mid)
+            grad.setColorAt(1.0, bot)
         else:
-            # the near thigh melts into the haunch instead of showing a hard edge
-            start = QColor(body)
-            start.setAlpha(0)
-            grad.setColorAt(0.0, start)
-            grad.setColorAt(fade_end * 0.55, QColor(body.red(), body.green(), body.blue(), 150))
-        grad.setColorAt(fade_end, top)
-        grad.setColorAt(0.70, mid)
-        grad.setColorAt(1.0, bot)
+            if far:
+                grad.setColorAt(0.0, top)
+                grad.setColorAt(at(pivot[1] + 6), top)
+            else:
+                # the upper leg grows out of the chest in the coat colour, then blends
+                # softly into the grey-brown lower leg
+                grad.setColorAt(0.0, body)
+                grad.setColorAt(at(pivot[1] + 10), body)
+                grad.setColorAt(at(pivot[1] + 21), mix(top, body, 0.12))
+            grad.setColorAt(0.70, mid)
+            grad.setColorAt(1.0, bot)
 
-        # draw on its own layer so the grain only lands on the leg
         layer = QImage(p.device().size(), QImage.Format.Format_ARGB32_Premultiplied)
         layer.fill(Qt.GlobalColor.transparent)
         lp = QPainter(layer)
         lp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         lp.setPen(Qt.PenStyle.NoPen)
-        # soft darker rim like the painted edges: a slightly inflated silhouette
-        # underneath (stronger on the near leg so it reads as a separate shape
-        # where it crosses the far leg; fades out near the hip)
-        rim = QLinearGradient(QPointF(0, hip[1] + 6), QPointF(0, hip[1] + 20))
+        # soft darker rim like the painted edges (fades out near the body)
+        rim_start = pivot[1] + (10 if hind else 6)
+        rim = QLinearGradient(QPointF(0, rim_start), QPointF(0, rim_start + 14))
         rim.setColorAt(0.0, QColor(45, 35, 30, 0))
         rim.setColorAt(1.0, QColor(45, 35, 30, 80 if far else 140))
-        lp.setBrush(QBrush(rim))
-        self.fill_shapes(lp, self.leg_shapes(hip, hock, paw, k, grow=0.9))
-        lp.setBrush(QBrush(grad))
-        self.fill_shapes(lp, self.leg_shapes(hip, hock, paw, k))
+        if hind:
+            # one furry haunch silhouette wrapped around hip-knee-hock (like the reference
+            # sketch), with the slim metatarsus and paw below it
+            shape = self.haunch_path(joints, k)
+            lp.setBrush(QBrush(grad))
+            lp.drawPath(shape)
+            lp.setPen(QPen(QBrush(rim), 1.5))
+            lp.setBrush(Qt.BrushStyle.NoBrush)
+            lp.drawPath(shape)
+            lp.setPen(Qt.PenStyle.NoPen)
+        else:
+            # fluffy upper arm (fur bulging under the chest, with little tufts at the
+            # back of the elbow) that narrows into the lower leg and paw
+            shape = self.fore_path(joints, k)
+            if not far:
+                # soft fur fringe: a faint wider halo in the same colours
+                halo = QPen(QBrush(grad), 2.6)
+                halo.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                lp.setOpacity(0.35)
+                lp.setPen(halo)
+                lp.setBrush(Qt.BrushStyle.NoBrush)
+                lp.drawPath(shape)
+                lp.setOpacity(1.0)
+            lp.setPen(Qt.PenStyle.NoPen)
+            lp.setBrush(QBrush(grad))
+            lp.drawPath(shape)
+            lp.setPen(QPen(QBrush(rim), 1.3))
+            lp.setBrush(Qt.BrushStyle.NoBrush)
+            lp.drawPath(shape)
+            lp.setPen(Qt.PenStyle.NoPen)
         lp.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceAtop)
         lp.fillRect(layer.rect(), QBrush(self.grain))
+        if body_mask is not None:
+            # Near legs are joined to the body by its real outline, not by a fixed
+            # height: the leg stays opaque everywhere outside the body (so it can never
+            # look detached, however far it swings) and fades out just inside the
+            # belly edge, so the fur blends into the painted body.
+            lp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
+            for shift, opacity in ((3, 0.35), (6, 0.6), (9, 1.0)):
+                lp.setOpacity(opacity)
+                lp.drawImage(0, -shift, body_mask)
+            lp.setOpacity(1.0)
         lp.end()
         p.drawImage(0, 0, layer)
 
+    def fore_path(self, joints, k):
+        """Fore leg silhouette: a full, furry upper arm that grows out of the chest
+        (wider than the leg, bulging most at the back where the elbow fur is), tapering
+        to the wrist, then the short pastern and a round paw."""
+        S, Wr, P = joints[0], joints[2], joints[3]
+        dx, dy = Wr[0] - S[0], Wr[1] - S[1]
+        L = max(1e-3, math.hypot(dx, dy))
+        ux, uy = dx / L, dy / L
+        nx, ny = -uy, ux                       # points to the back (the cat faces +x)
+        # half-widths along the leg (t: -0.3 inside the chest ... 1.0 at the wrist)
+        # (the belly line crosses the leg around t=0.35, so the fluff peaks just below it)
+        back_keys = [(-0.3, 10.0), (0.2, 11.0), (0.5, 11.5), (0.76, 6.4), (1.0, 4.2)]
+        front_keys = [(-0.3, 9.5), (0.3, 9.5), (0.56, 7.6), (0.82, 5.0), (1.0, 4.2)]
+
+        def width(keys, t):
+            for (t0, w0), (t1, w1) in zip(keys, keys[1:]):
+                if t <= t1:
+                    e = (t - t0) / (t1 - t0)
+                    e = (1 - math.cos(math.pi * e)) / 2
+                    return (w0 + (w1 - w0) * e) * k
+            return keys[-1][1] * k
+
+        ts = [-0.3 + 1.3 * i / 26 for i in range(27)]
+        # sample index -> extra fur length on the back edge (little tufts at the elbow)
+        tufts = {16: 1.0, 17: 2.4, 18: 0.6, 19: 0.8, 20: 2.0, 21: 0.4, 22: 1.0}
+        back, front = [], []
+        for i, t in enumerate(ts):
+            cx, cy = S[0] + dx * t, S[1] + dy * t
+            wb = width(back_keys, t) + tufts.get(i, 0.0) * k
+            drop = 0.9 * tufts.get(i, 0.0) * k              # tufts point a little downward
+            back.append(QPointF(cx + nx * wb + ux * drop, cy + ny * wb + uy * drop))
+            wf = width(front_keys, t)
+            front.append(QPointF(cx - nx * wf, cy - ny * wf))
+        path = QPainterPath(back[0])
+        for q in back[1:]:
+            path.lineTo(q)
+        for q in reversed(front):
+            path.lineTo(q)
+        path.closeSubpath()
+        # slim ankle + a small flat paw (toes forward, flat on the floor - not a hoof)
+        w1, w2 = 8.4 * k, 6.0 * k
+        # unite piece by piece: overlapping sub-paths in one path would cancel out
+        # (odd-even fill) and punch holes into the paw
+        pieces = [QPainterPath() for _ in range(3)]
+        pieces[0].addPolygon(self.tapered(Wr, P, w1, w2))
+        pieces[0].closeSubpath()
+        pieces[1].addEllipse(QPointF(*Wr), w1 / 2, w1 / 2)
+        pieces[2].addEllipse(QPointF(P[0] + 1.8, P[1] + 0.9), 4.6 * k, 1.9 * k)
+        for piece in pieces:
+            path = path.united(piece)
+        return path.simplified()
+
+    def haunch_path(self, joints, k):
+        """Outline of a hind leg as seen on a real cat: the knee and shin are hidden
+        inside the furry thigh, whose back edge runs from the rump down to the hock
+        (heel) and whose front edge runs from the belly past the knee to the hock.
+        Below the hock only the slim metatarsus and the paw show."""
+        H, K, Hk, P = [QPointF(*j) for j in joints]
+        r = 15.0 * k                                   # half-width of the thigh at the hip
+        A = QPointF(H.x() - r, H.y() - 8)              # rump (rear top, inside the body)
+        B = QPointF(H.x() + r * 0.8, H.y() - 8)        # flank (front top, inside the body)
+        Kf = QPointF(K.x() + 5 * k, K.y() + 2)         # front of the knee (stifle)
+        # sturdy lower leg ending in a small, flat paw (not a hoof)
+        Hf = QPointF(Hk.x() + 4.0 * k, Hk.y() - 1)      # front of the hock
+        Pf = QPointF(P.x() + 3.0 * k, P.y() - 1.6)      # top of the toes
+        Ph = QPointF(P.x() - 3.0 * k, P.y() - 1.6)      # back of the paw
+        path = QPainterPath()
+        path.moveTo(A)
+        path.cubicTo(QPointF(A.x() + 6, H.y() - 15), QPointF(B.x() - 6, H.y() - 15), B)
+        # front edge: flank bulges slightly forward over the knee, then the shin runs
+        # back down to the front of the hock
+        path.cubicTo(QPointF(B.x() + 4 * k, B.y() + 10), QPointF(Kf.x() + 2, Kf.y() - 6), Kf)
+        path.cubicTo(QPointF(Kf.x(), Kf.y() + 7), QPointF(Hf.x() + 2.5, Hf.y() - 7), Hf)
+        # slim metatarsus down to the paw (toes forward, soft round paw)
+        path.lineTo(Pf)
+        path.quadTo(QPointF(P.x() + 7.0 * k, P.y() + 1.0), QPointF(P.x() + 3.0, P.y() + 2.8))
+        path.lineTo(QPointF(P.x() - 1.5, P.y() + 2.8))
+        path.quadTo(QPointF(P.x() - 4.0 * k, P.y() + 2.4), Ph)
+        # long fur ("britches") on the back of the thigh hangs down past the heel and
+        # hides the hock's bend, like a real cat seen from the side
+        ux, uy = P.x() - Hk.x(), P.y() - Hk.y()
+        ul = max(1e-3, math.hypot(ux, uy))
+        Mb = QPointF(Hk.x() + ux / ul * 6 - 4.2 * k, Hk.y() + uy / ul * 6)   # back of the lower leg
+        D = QPointF(Hk.x() - 7.5 * k, min(Hk.y() + 3.5, P.y() - 9))       # soft point of the fur
+        path.lineTo(Mb)
+        path.quadTo(QPointF(Mb.x() - 3.0 * k, Mb.y() + 0.5), D)
+        rear = QPainterPath(D)
+        c1 = QPointF(D.x() - 3.5 * k, D.y() - 15)
+        c2 = QPointF(A.x() - 4.0 * k, A.y() + 22)
+        rear.cubicTo(c1, c2, A)
+        path.cubicTo(c1, c2, A)
+        path.closeSubpath()
+        path.setFillRule(Qt.FillRule.WindingFill)
+        return path.simplified()
+
+    # px the torso rises above its painted height while walking (negative = sits lower,
+    # so the belly is as close to the floor as in the idle drawings)
+    STAND_TALL = -5
+
+    def body_motion(self):
+        """(bob_px, pitch_deg, stretch) of the torso for the current gait and phase."""
+        ph = self.walk_phase
+        if self.dragging or self.state == "fall" or self.state != "walk":
+            return 0.0, 0.0, 1.0
+        speed_k = min(1.0, abs(self.vx) / max(1.0, self.cruise_speed))
+        if self.gait == "gallop":
+            bob = 2.0 + 4.0 * (0.5 + 0.5 * math.cos(math.tau * (ph - 0.45)))   # airborne ~0.45
+            pitch = -5.0 * math.sin(math.tau * (ph - 0.20))   # nose up as the fore legs reach
+            # spine flex: extended in the air, gathered when the hind legs come under
+            stretch = 1.0 + 0.05 * math.cos(math.tau * (ph - 0.45))
+            return bob * speed_k, pitch * speed_k, 1.0 + (stretch - 1.0) * speed_k
+        # walk: torso dips slightly twice per cycle when a leg passes under it
+        return 0.8 * (0.5 + 0.5 * math.cos(math.tau * 2 * ph)) * speed_k, 0.0, 1.0
+
     def compose_walk(self, idx):
-        """Walk frame = far hind leg, then body, then near hind leg."""
+        """Walk frame = far legs, then the body, then the near legs."""
         idx %= len(self.frames["walk"])
         body = self.frames["walk"][idx]
-        if self.rig is None:
+        if self.rig is None or "shoulders" not in self.rig:
             return body
-        img = QImage(body.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        # extra headroom on top: the torso stands a little taller so the legs can extend
+        extra = max(8, self.STAND_TALL + 8)
+        img = QImage(body.width(), body.height() + extra, QImage.Format.Format_ARGB32_Premultiplied)
         img.fill(Qt.GlobalColor.transparent)
         p = QPainter(img)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        hip = tuple(self.rig["hips"][idx])
-        ground = float(self.rig["ground"])
-        ph = (self.walk_phase + self.HIND_PHASE) % 1.0
-        far_hip = (hip[0] + self.FAR_HIP[0], hip[1] + self.FAR_HIP[1])
-        self.draw_hind_leg(p, far_hip, (ph + 0.5) % 1.0, ground, far=True)
-        p.drawPixmap(0, 0, body)
-        self.draw_hind_leg(p, hip, ph, ground, far=False)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        ground = float(self.rig["ground"]) - 1 + extra     # paws touch the image bottom
+        hip = self.rig["hips"][idx]
+        sho = self.rig["shoulders"][idx]
+        bob, pitch, stretch = self.body_motion()
+        # the torso rocks/flexes around its middle; legs stay attached to the moved hips/shoulders
+        mid = QPointF((hip[0] + sho[0]) / 2, (hip[1] + sho[1]) / 2)
+        tf = QTransform()
+        tf.translate(mid.x(), mid.y() + extra - self.STAND_TALL - bob)
+        tf.rotate(pitch)
+        tf.scale(stretch, 1.0)
+        tf.translate(-mid.x(), -mid.y())
+        g = self.GAITS[self.gait]
+        poses = {}
+        for leg, off in g["offsets"].items():
+            base = hip if leg.endswith("H") else sho
+            far = leg not in self.NEAR
+            bx, by = base[0] + (self.FAR_OFFSET[0] if far else 0), base[1] + (self.FAR_OFFSET[1] if far else 0)
+            m = tf.map(QPointF(bx, by))
+            poses[leg] = self.leg_pose(leg, (m.x(), m.y()), (self.walk_phase + off) % 1.0, ground)
+        for leg in ("LH", "LF"):
+            self.draw_leg(p, poses[leg], leg.endswith("H"), True, ground)
+        body_img = QImage(img.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        body_img.fill(Qt.GlobalColor.transparent)
+        bp = QPainter(body_img)
+        bp.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        bp.setTransform(tf)
+        bp.drawPixmap(0, 0, body)
+        bp.end()
+        p.drawImage(0, 0, body_img)
+        for leg in ("RH", "RF"):
+            self.draw_leg(p, poses[leg], leg.endswith("H"), False, ground, body_img)
         p.end()
         return QPixmap.fromImage(img)
 
@@ -810,6 +1085,9 @@ class LifelikeCat(QWidget):
             return
         self.target_x = target_x
         self.cruise_speed = speed or self.WALK_SPEED * random.uniform(0.75, 1.25)
+        self.gait = "gallop" if self.cruise_speed > 80 else "walk"
+        if self.state != "walk":
+            self.walk_phase = 0.0
         want_left = target_x < self.x
         if want_left != self.facing_left:
             # Real cats stop and hesitate before turning around
@@ -834,8 +1112,7 @@ class LifelikeCat(QWidget):
             ("look", 2.0),
             ("sit", 2.0),
             ("groom", 1.0),
-            ("trot", 0.6),
-            ("nap", 0.3 + self.tired * 2.5),
+            ("run", 0.6),
             ("investigate", 3.0 if cursor_near else 0.0),
         ]
         choice = random.choices([o[0] for o in options], [o[1] for o in options])[0]
@@ -847,16 +1124,17 @@ class LifelikeCat(QWidget):
             if self.x + direction * dist < self.min_x or self.x + direction * dist > self.max_x:
                 direction = -direction
             self.start_walk(self.x + direction * dist)
-        elif choice == "trot":
-            self.start_walk(random.uniform(self.min_x, self.max_x), self.TROT_SPEED)
+        elif choice == "run":
+            # zoomies: dash a good distance across the screen
+            dist = random.uniform(400, 900)
+            direction = -1 if self.x - dist > self.min_x and (random.random() < 0.5 or self.x + dist > self.max_x) else 1
+            self.start_walk(self.x + direction * dist, self.RUN_SPEED * random.uniform(0.9, 1.1))
         elif choice == "look":
             self.enter("stand", random.uniform(2.0, 5.0))
         elif choice == "sit":
             self.enter("sit", random.uniform(5.0, 12.0))
         elif choice == "groom":
             self.enter("groom", random.uniform(3.0, 6.0))
-        elif choice == "nap":
-            self.enter("lie", 1.2)
         elif choice == "investigate":
             stop_short = 70 if dx > 0 else -70
             self.start_walk(self.x + dx - stop_short, self.WALK_SPEED * 1.1)
@@ -890,7 +1168,6 @@ class LifelikeCat(QWidget):
             return
 
         self.landing_squash = approach(self.landing_squash, 0.0, dt * 4)
-        self.tired = min(1.0, self.tired + dt / 600.0)  # ~10 min to get sleepy
 
         # -------- break mode: go to sleep --------
         if self.mode == "Break" and self.state not in ("lie", "sleep", "fall"):
@@ -924,13 +1201,11 @@ class LifelikeCat(QWidget):
             if self.state_time >= self.state_duration:
                 self.enter("stand", random.uniform(0.6, 1.4))
         elif s == "lie":
-            # brief transition pose before curling up
+            # brief transition pose before curling up (only ever happens on a break)
             if self.state_time >= self.state_duration:
-                dur = math.inf if self.mode == "Break" else random.uniform(20, 60)
-                self.enter("sleep", dur)
+                self.enter("sleep", math.inf)
         elif s == "sleep":
-            if self.state_time >= self.state_duration:
-                self.tired = 0.0
+            if self.mode == "Work":   # never sleep while working
                 self.enter("stretch_up", 1.0)
         elif s == "stretch_up":
             if self.state_time >= self.state_duration:
@@ -943,14 +1218,19 @@ class LifelikeCat(QWidget):
         dist = self.target_x - self.x
         direction = -1.0 if dist < 0 else 1.0
         speed = abs(self.vx)
+        running = self.gait == "gallop"
+        accel = self.RUN_ACCEL if running else self.ACCEL
+        decel = self.RUN_DECEL if running else self.DECEL
         # Arrive behaviour: begin slowing early enough to stop on target
-        stopping_dist = speed * speed / (2 * self.DECEL)
+        stopping_dist = speed * speed / (2 * decel)
         if abs(dist) <= stopping_dist + 1.0:
-            speed = approach(speed, 0.0, self.DECEL * dt)
+            speed = approach(speed, 0.0, decel * dt)
         else:
-            speed = approach(speed, self.cruise_speed, self.ACCEL * dt)
-        # slight natural speed wobble per stride
-        speed_now = speed * (1.0 + 0.06 * math.sin(self.walk_phase * math.tau * 2))
+            speed = approach(speed, self.cruise_speed, accel * dt)
+        # natural surge: a walk wobbles twice per cycle, a gallop surges once per bound
+        surge = 0.10 * math.cos(math.tau * (self.walk_phase - 0.5)) if running else \
+            0.06 * math.sin(self.walk_phase * math.tau * 2)
+        speed_now = speed * (1.0 + surge)
         self.vx = direction * speed
         move = direction * speed_now * dt
         if abs(move) >= abs(dist) or (speed < 2.0 and abs(dist) < 4.0):
@@ -964,8 +1244,8 @@ class LifelikeCat(QWidget):
                 self.enter("stand", random.uniform(1.5, 4.5))
             return
         self.x += move
-        # Walk cycle advances with distance -> paws stay planted
-        stride = self.STRIDE_PX * self.SPRITE_SCALE
+        # The gait cycle advances with distance -> paws stay planted
+        stride = self.gait_params()[1] * self.SPRITE_SCALE
         self.walk_phase = (self.walk_phase + abs(move) / stride) % 1.0
 
     def update_look(self, dt):
@@ -1244,6 +1524,9 @@ class LifelikeCat(QWidget):
         on = mu.addAction("Music on", lambda: self.music.set_enabled(not self.music.enabled))
         on.setCheckable(True)
         on.setChecked(self.music.enabled)
+        sc = mu.addAction("Show music controls", self.toggle_music_controls)
+        sc.setCheckable(True)
+        sc.setChecked(self.show_music_controls)
         if self.music.enabled and not self.music.has_source:
             mu.addSeparator()
             mu.addAction("Add your study playlist..." if EDITION["study"]
@@ -1290,7 +1573,7 @@ class LifelikeCat(QWidget):
             return "sit", (0 if (self.time * 0.15) % 1 < 0.7 else 1) % n
         if s == "groom":
             n = len(self.frames["groom"])
-            return "groom", int(self.pose_clock * 2.2) % n
+            return "groom", int(self.pose_clock * 3.0) % n
         if s == "lie":
             return "lie", 0
         if s == "stretch_up":
@@ -1309,6 +1592,18 @@ class LifelikeCat(QWidget):
         pm = self.sprite(name, idx, self.facing_left)
         w = pm.width() * self.SPRITE_SCALE
         h = pm.height() * self.SPRITE_SCALE
+        # crossfade between different drawings (e.g. walk -> sit) so pose changes feel
+        # like one cat moving rather than a picture being swapped
+        last = getattr(self, "_last_draw", None)
+        if last is not None and last[0] != name and not self.dragging:
+            self._fade = (last[1], last[2], last[3], self.time)
+        self._last_draw = (name, pm, w, h)
+        fade = getattr(self, "_fade", None)
+        fade_k = 0.0
+        if fade is not None:
+            fade_k = 1.0 - (self.time - fade[3]) / self.POSE_FADE
+            if fade_k <= 0 or self.dragging:
+                self._fade, fade_k = None, 0.0
         cx, gy = self.W / 2, self.GROUND_Y
         if self.on_bed and not self.dragging:
             gy -= self.BED_SINK   # rest on the cushion, not on the floor
@@ -1351,7 +1646,13 @@ class LifelikeCat(QWidget):
             p.translate(-pivot)
         p.translate(cx, gy)
         p.scale(sx, sy)
+        if fade_k > 0:
+            opm, ow, oh = fade[0], fade[1], fade[2]
+            p.setOpacity(fade_k)
+            p.drawPixmap(QRectF(-ow / 2, -oh, ow, oh), opm, QRectF(opm.rect()))
+            p.setOpacity(min(1.0, 1.0 - fade_k * 0.75))
         p.drawPixmap(QRectF(-w / 2, -h - bob, w, h), pm, QRectF(pm.rect()))
+        p.setOpacity(1.0)
         p.restore()
         if self.on_bed and not self.dragging:
             draw_cat_bed(p, cx, gy + self.BED_SINK, "front")
@@ -1360,6 +1661,24 @@ class LifelikeCat(QWidget):
         p.end()
 
     BADGE = QRectF(30, 196, 180, 94)
+    POSE_FADE = 0.28     # seconds to crossfade between different drawings
+
+    def music_ui(self):
+        """'full' = buttons + song title, 'hint' = one line of text, 'none' = hidden."""
+        m = self.music
+        if not self.show_music_controls:
+            return "none"
+        return "full" if (m.enabled and m.has_source) else "hint"
+
+    def badge_rect(self):
+        h = {"full": 94, "hint": 64, "none": 44}[self.music_ui()]
+        return QRectF(self.BADGE.x(), self.BADGE.y(), self.BADGE.width(), h)
+
+    def toggle_music_controls(self):
+        self.show_music_controls = not self.show_music_controls
+        self.music.settings.setValue("ui/music_controls", "true" if self.show_music_controls else "false")
+        self.hover_btn = None
+        self.update()
     BUTTONS = ("prev", "play", "next", "mute", "vol_down", "vol_up")
 
     def button_rects(self):
@@ -1371,7 +1690,7 @@ class LifelikeCat(QWidget):
                 for i, name in enumerate(self.BUTTONS)}
 
     def button_at(self, pos):
-        if not self.music.enabled:
+        if self.music_ui() != "full":
             return None
         for name, r in self.button_rects().items():
             if r.contains(pos):
@@ -1448,7 +1767,8 @@ class LifelikeCat(QWidget):
         mm, ss = divmod(self.remaining, 60)
         bg = QColor("#40352f")
         bg.setAlpha(225)
-        r = self.BADGE
+        r = self.badge_rect()
+        ui = self.music_ui()
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(bg)
         p.drawRoundedRect(r, 12, 12)
@@ -1457,7 +1777,7 @@ class LifelikeCat(QWidget):
         p.drawText(QRectF(r.x(), r.y() + 3, r.width(), 20), Qt.AlignmentFlag.AlignCenter,
                    f"{self.mode}  {mm:02d}:{ss:02d}")
         status = {
-            "walk": "Strolling..." if self.cruise_speed < 80 else "Zoomies!",
+            "walk": "Zoomies!" if self.gait == "gallop" else "Strolling...",
             "turn": "Hmm?", "stand": "Looking around", "sit": "Sitting",
             "groom": "Grooming", "lie": "Lying down", "sleep": "Zzz...",
             "stretch_up": "Stretching", "fall": "Wheee!",
@@ -1469,24 +1789,27 @@ class LifelikeCat(QWidget):
         p.setFont(QFont("Segoe UI", 8))
         p.drawText(QRectF(r.x(), r.y() + 23, r.width(), 18), Qt.AlignmentFlag.AlignCenter, status)
 
-        # ---- music controls ----
+        # ---- music controls (only when there is music to control) ----
+        if ui == "none":
+            return
         p.setPen(QColor(255, 255, 255, 40))
         p.drawLine(QPointF(r.x() + 12, r.y() + 43), QPointF(r.right() - 12, r.y() + 43))
         m = self.music
-        for name, br in self.button_rects().items():
-            if m.enabled and name == self.hover_btn:
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QColor(255, 255, 255, 45))
-                p.drawRoundedRect(br, 6, 6)
-            col = QColor(255, 255, 255, 235 if m.enabled and m.ready else 90)
-            self.draw_icon(p, name, br, col)
+        if ui == "full":
+            for name, br in self.button_rects().items():
+                if name == self.hover_btn:
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QColor(255, 255, 255, 45))
+                    p.drawRoundedRect(br, 6, 6)
+                col = QColor(255, 255, 255, 235 if m.ready else 90)
+                self.draw_icon(p, name, br, col)
 
         # song title (scrolls when it is too long to fit)
         if not m.enabled:
             title = "Music off (right-click > Music)"
         elif not m.has_source:
-            title = ("Right-click to add your study playlist" if EDITION["study"]
-                     else "Right-click > Music to add music")
+            title = ("Right-click: add study playlist" if EDITION["study"]
+                     else "Right-click to add music")
         elif m.error and not m.ready:
             title = f"Music unavailable ({m.error})"
         elif not m.ready:
@@ -1500,7 +1823,7 @@ class LifelikeCat(QWidget):
         font = QFont("Segoe UI", 8)
         p.setFont(font)
         p.setPen(QColor(255, 236, 210, 220))
-        tr = QRectF(r.x() + 10, r.y() + 72, r.width() - 20, 16)
+        tr = QRectF(r.x() + 10, r.y() + (72 if ui == "full" else 45), r.width() - 20, 16)
         tw = QFontMetrics(font).horizontalAdvance(title)
         p.save()
         p.setClipRect(tr)
