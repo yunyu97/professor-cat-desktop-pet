@@ -923,18 +923,27 @@ class LifelikeCat(QWidget):
         for q in reversed(front):
             path.lineTo(q)
         path.closeSubpath()
-        # slim ankle + a small flat paw (toes forward, flat on the floor - not a hoof)
-        w1, w2 = 8.4 * k, 6.0 * k
+        # storybook foot (as in the reference painting): the leg narrows to a slim
+        # ankle and ends in one thin pointed toe lying flat and pointing forward
+        w1 = 8.4 * k
+        lx, ly = P[0] - Wr[0], P[1] - Wr[1]
+        ll = max(1e-3, math.hypot(lx, ly))
+        u = (lx / ll, ly / ll)
+        n = (-u[1], u[0])                      # back of the leg
+        at = lambda b, f, d: QPointF(P[0] + n[0] * b + u[0] * d - n[0] * f,
+                                     P[1] + n[1] * b + u[1] * d - n[1] * f)
+        foot = QPainterPath()
+        foot.moveTo(QPointF(Wr[0] + n[0] * w1 / 2, Wr[1] + n[1] * w1 / 2))
+        foot.quadTo(at(2.8 * k, 0, -3.0), at(2.2 * k, 0, 2.6))          # back edge to heel
+        foot.lineTo(at(0, 8.5 * k, 2.6))                                 # flat sole to the toe tip
+        foot.quadTo(at(0, 3.0 * k, 1.0), at(0, 2.4 * k, -2.5))           # concave top of the toe
+        foot.lineTo(QPointF(Wr[0] - n[0] * w1 / 2, Wr[1] - n[1] * w1 / 2))
+        foot.closeSubpath()
+        wrist = QPainterPath()
+        wrist.addEllipse(QPointF(*Wr), w1 / 2, w1 / 2)
         # unite piece by piece: overlapping sub-paths in one path would cancel out
-        # (odd-even fill) and punch holes into the paw
-        pieces = [QPainterPath() for _ in range(3)]
-        pieces[0].addPolygon(self.tapered(Wr, P, w1, w2))
-        pieces[0].closeSubpath()
-        pieces[1].addEllipse(QPointF(*Wr), w1 / 2, w1 / 2)
-        pieces[2].addEllipse(QPointF(P[0] + 1.8, P[1] + 0.9), 4.6 * k, 1.9 * k)
-        for piece in pieces:
-            path = path.united(piece)
-        return path.simplified()
+        # (odd-even fill) and punch holes
+        return path.united(wrist).united(foot).simplified()
 
     def haunch_path(self, joints, k):
         """Outline of a hind leg as seen on a real cat: the knee and shin are hidden
@@ -946,10 +955,15 @@ class LifelikeCat(QWidget):
         A = QPointF(H.x() - r, H.y() - 8)              # rump (rear top, inside the body)
         B = QPointF(H.x() + r * 0.8, H.y() - 8)        # flank (front top, inside the body)
         Kf = QPointF(K.x() + 5 * k, K.y() + 2)         # front of the knee (stifle)
-        # sturdy lower leg ending in a small, flat paw (not a hoof)
+        # slim lower leg ending in one thin pointed toe, flat and pointing forward
+        # (like the reference painting)
         Hf = QPointF(Hk.x() + 4.0 * k, Hk.y() - 1)      # front of the hock
-        Pf = QPointF(P.x() + 3.0 * k, P.y() - 1.6)      # top of the toes
-        Ph = QPointF(P.x() - 3.0 * k, P.y() - 1.6)      # back of the paw
+        mx, my = P.x() - Hk.x(), P.y() - Hk.y()
+        ml = max(1e-3, math.hypot(mx, my))
+        u = (mx / ml, my / ml)
+        n = (-u[1], u[0])                               # back of the leg
+        at = lambda b, f, d: QPointF(P.x() + n[0] * b + u[0] * d - n[0] * f,
+                                     P.y() + n[1] * b + u[1] * d - n[1] * f)
         path = QPainterPath()
         path.moveTo(A)
         path.cubicTo(QPointF(A.x() + 6, H.y() - 15), QPointF(B.x() - 6, H.y() - 15), B)
@@ -957,11 +971,11 @@ class LifelikeCat(QWidget):
         # back down to the front of the hock
         path.cubicTo(QPointF(B.x() + 4 * k, B.y() + 10), QPointF(Kf.x() + 2, Kf.y() - 6), Kf)
         path.cubicTo(QPointF(Kf.x(), Kf.y() + 7), QPointF(Hf.x() + 2.5, Hf.y() - 7), Hf)
-        # slim metatarsus down to the paw (toes forward, soft round paw)
-        path.lineTo(Pf)
-        path.quadTo(QPointF(P.x() + 7.0 * k, P.y() + 1.0), QPointF(P.x() + 3.0, P.y() + 2.8))
-        path.lineTo(QPointF(P.x() - 1.5, P.y() + 2.8))
-        path.quadTo(QPointF(P.x() - 4.0 * k, P.y() + 2.4), Ph)
+        # slim metatarsus down to the ankle, then the pointed toe and a flat sole
+        path.lineTo(at(0, 2.6 * k, -2.5))
+        path.quadTo(at(0, 3.2 * k, 1.0), at(0, 8.5 * k, 2.6))
+        path.lineTo(at(2.2 * k, 0, 2.6))
+        path.quadTo(at(2.8 * k, 0, -1.0), at(2.8 * k, 0, -3.0))
         # long fur ("britches") on the back of the thigh hangs down past the heel and
         # hides the hock's bend, like a real cat seen from the side
         ux, uy = P.x() - Hk.x(), P.y() - Hk.y()
