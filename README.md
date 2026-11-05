@@ -24,7 +24,8 @@ See **Releases** for ready-to-run builds:
 ## What the cat does
 
 - Walks, turns, sits, grooms, naps and wanders over to look at your mouse pointer.
-  Hind legs are animated separately (near leg in front, darker far leg behind) with planted paws.
+  All four legs are animated with a real walk/gallop gait (near legs in front, darker far legs
+  behind) with planted paws.
 - Pick it up and it dangles; drop or throw it and it falls and lands.
 - **Double-click** the cat to start/pause the timer. **Right-click** for presets, modes and music.
 - **Music controls** on the badge: previous · play/pause · next · mute · volume − / +, with the song title.
